@@ -881,6 +881,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         request_attestation: bool,
     ) {
+        self.models_refresh_worker.client_initialized(connection_id);
         self.account_processor
             .notify_workspace_routing_to_connection(connection_id);
         self.thread_processor
@@ -942,6 +943,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         session_state: &ConnectionSessionState,
     ) {
+        self.models_refresh_worker.client_closed(connection_id);
         session_state.disconnect.cancel();
         session_state.rpc_gate.close().await;
         self.account_processor
