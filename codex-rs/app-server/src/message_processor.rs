@@ -580,6 +580,7 @@ impl MessageProcessor {
         );
         let turn_processor = TurnRequestProcessor::new(
             Arc::clone(&thread_manager),
+            Arc::clone(&thread_store),
             outgoing.clone(),
             analytics_events_client.clone(),
             Arc::clone(&config),
@@ -881,6 +882,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         request_attestation: bool,
     ) {
+        self.outgoing.connection_initialized(connection_id).await;
         self.models_refresh_worker.client_initialized(connection_id);
         self.account_processor
             .notify_workspace_routing_to_connection(connection_id);
@@ -945,6 +947,7 @@ impl MessageProcessor {
     ) {
         self.models_refresh_worker.client_closed(connection_id);
         session_state.disconnect.cancel();
+        self.outgoing.stop_connection_replays(connection_id).await;
         session_state.rpc_gate.close().await;
         self.account_processor
             .gateway_connection_closed(connection_id);
