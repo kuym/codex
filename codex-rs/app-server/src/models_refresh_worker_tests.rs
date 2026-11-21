@@ -185,6 +185,7 @@ async fn refreshes_immediately_periodically_and_stops_when_dropped() {
         test_thread_manager(&config, Some(Arc::clone(&models_manager)), auth_manager),
     ));
     let worker = spawn_with_interval(&catalog, Duration::from_millis(/*millis*/ 10));
+    worker.client_initialized(ConnectionId(/*id*/ 1));
 
     endpoint.wait_for_fetch_count(/*expected*/ 2).await;
     drop(worker);
@@ -273,6 +274,7 @@ async fn background_refresh_blocks_invalid_requirements_then_recovers() -> anyho
         tracing_subscriber::registry().with(feedback.logger_layer()),
     );
     let worker = spawn_with_interval(&catalog, Duration::from_millis(/*millis*/ 10));
+    worker.client_initialized(ConnectionId(/*id*/ 1));
     tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
         for expected in 1..=2 {
             checks_rx.recv().await.unwrap().send(/*t*/ None).unwrap();
@@ -429,5 +431,139 @@ async fn catalog_reload_recovers_original_project_after_startup_fallback() -> an
             .collect::<Vec<_>>(),
         vec!["project-model"]
     );
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct CountingModelsEndpoint {
+    fetch_count: AtomicUsize,
+    fetched: Notify,
+}
+
+impl CountingModelsEndpoint {
+    fn count(&self) -> usize {
+        self.fetch_count.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_fetch_count(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(/*secs*/ 5), async {
+            while self.count() < expected {
+                self.fetched.notified().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {expected} model fetches"));
+    }
+}
+
+impl ModelsEndpointClient for CountingModelsEndpoint {
+    fn for_originator(
+        &self,
+        _originator: codex_models_manager::ModelCatalogOriginator,
+    ) -> Option<Arc<dyn ModelsEndpointClient>> {
+        None
+    }
+
+    fn identity(&self) -> Option<String> {
+        Some("test-provider".to_string())
+    }
+
+    fn has_command_auth(&self) -> bool {
+        true
+    }
+
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { false })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _client_version: &'a str,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
+        Box::pin(async move {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.fetched.notify_one();
+            Ok(ModelsEndpointResponse {
+                models: Vec::new(),
+                etag: None,
+                identity: "test-provider".to_string(),
+            })
+        })
+    }
+}
+
+async fn counting_catalog(
+    home: &std::path::Path,
+) -> anyhow::Result<(Arc<ModelCatalog>, Arc<CountingModelsEndpoint>)> {
+    let config_manager =
+        crate::config_manager::ConfigManager::without_managed_config_for_tests(home.to_path_buf());
+    let config = Arc::new(config_manager.load_non_project_config().await?);
+    let endpoint = Arc::new(CountingModelsEndpoint::default());
+    let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
+        home.to_path_buf(),
+        endpoint.clone(),
+        /*auth_manager*/ None,
+    ));
+    let auth_manager = codex_login::AuthManager::shared_from_config(
+        config.as_ref(),
+        /*enable_codex_api_key_env*/ false,
+    )
+    .await?;
+    let catalog = Arc::new(ModelCatalog::new(
+        config_manager,
+        /*startup_cwd*/ None,
+        Arc::clone(&config),
+        test_thread_manager(&config, Some(models_manager), auth_manager),
+    ));
+    Ok((catalog, endpoint))
+}
+
+#[tokio::test]
+async fn does_not_refresh_until_a_client_attaches() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let (catalog, endpoint) = counting_catalog(home.path()).await?;
+    let worker = spawn_with_interval(&catalog, Duration::from_secs(/*secs*/ 3600));
+
+    tokio::time::sleep(Duration::from_millis(/*millis*/ 100)).await;
+    assert_eq!(endpoint.count(), 0);
+
+    worker.client_initialized(ConnectionId(/*id*/ 1));
+    endpoint.wait_for_fetch_count(/*expected*/ 1).await;
+
+    // Reconnect before the next refresh is due.
+    worker.client_initialized(ConnectionId(/*id*/ 1));
+    worker.client_closed(ConnectionId(/*id*/ 99));
+    worker.client_closed(ConnectionId(/*id*/ 1));
+    worker.client_initialized(ConnectionId(/*id*/ 2));
+    worker.client_closed(ConnectionId(/*id*/ 2));
+    tokio::time::sleep(Duration::from_millis(/*millis*/ 100)).await;
+    assert_eq!(endpoint.count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pauses_periodic_refresh_when_last_client_detaches() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let (catalog, endpoint) = counting_catalog(home.path()).await?;
+    let worker = spawn_with_interval(&catalog, Duration::from_millis(/*millis*/ 10));
+
+    worker.client_initialized(ConnectionId(/*id*/ 1));
+    worker.client_initialized(ConnectionId(/*id*/ 2));
+    endpoint.wait_for_fetch_count(/*expected*/ 3).await;
+
+    worker.client_closed(ConnectionId(/*id*/ 1));
+    let with_one_client = endpoint.count();
+    endpoint.wait_for_fetch_count(with_one_client + 2).await;
+
+    // Let any in-flight refresh finish before checking the count.
+    worker.client_closed(ConnectionId(/*id*/ 2));
+    tokio::time::sleep(Duration::from_millis(/*millis*/ 100)).await;
+    let paused = endpoint.count();
+    tokio::time::sleep(Duration::from_millis(/*millis*/ 200)).await;
+    assert_eq!(endpoint.count(), paused);
+
+    worker.client_initialized(ConnectionId(/*id*/ 3));
+    endpoint.wait_for_fetch_count(paused + 1).await;
     Ok(())
 }
